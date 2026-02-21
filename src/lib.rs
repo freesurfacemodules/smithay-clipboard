@@ -12,6 +12,7 @@ use sctk::reexports::calloop::channel::{self, Sender};
 use sctk::reexports::client::Connection;
 use sctk::reexports::client::backend::Backend;
 
+pub mod dnd;
 mod mime;
 mod state;
 mod worker;

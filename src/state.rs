@@ -6,7 +6,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use sctk::data_device_manager::data_device::{DataDevice, DataDeviceHandler};
+use sctk::data_device_manager::data_device::{DataDevice, DataDeviceData, DataDeviceHandler};
 use sctk::data_device_manager::data_offer::{DataOfferError, DataOfferHandler, DragOffer};
 use sctk::data_device_manager::data_source::{CopyPasteSource, DataSourceHandler};
 use sctk::data_device_manager::{DataDeviceManagerState, WritePipe};
@@ -393,18 +393,83 @@ impl DataDeviceHandler for State {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &WlDataDevice,
-        _: f64,
-        _: f64,
+        data_device: &WlDataDevice,
+        x: f64,
+        y: f64,
         _: &WlSurface,
     ) {
+        let Some(data) = data_device.data::<DataDeviceData>() else { return };
+        let Some(offer) = data.drag_offer() else { return };
+        let mime_types = offer.with_mime_types(|m| m.to_vec());
+        if mime_types.iter().any(|m| m == "text/uri-list") {
+            offer.accept_mime_type(offer.serial, Some("text/uri-list".to_string()));
+            offer.set_actions(DndAction::Copy, DndAction::Copy);
+        }
+        crate::dnd::push_event(crate::dnd::DndEvent::Enter { x, y, mime_types });
     }
 
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        crate::dnd::push_event(crate::dnd::DndEvent::Leave);
+    }
 
-    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn motion(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlDataDevice,
+        x: f64,
+        y: f64,
+    ) {
+        crate::dnd::push_event(crate::dnd::DndEvent::Motion { x, y });
+    }
 
-    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        data_device: &WlDataDevice,
+    ) {
+        let Some(data) = data_device.data::<DataDeviceData>() else { return };
+        let Some(offer) = data.drag_offer() else { return };
+
+        let has_uri_list = offer.with_mime_types(|m| m.iter().any(|m| m == "text/uri-list"));
+        if !has_uri_list {
+            return;
+        }
+
+        let x = offer.x;
+        let y = offer.y;
+
+        let read_pipe = match offer.receive("text/uri-list".to_string()) {
+            Ok(pipe) => pipe,
+            Err(_) => return,
+        };
+
+        offer.finish();
+
+        if set_non_blocking(read_pipe.as_raw_fd()).is_err() {
+            return;
+        }
+
+        let mut reader_buffer = [0u8; 4096];
+        let mut content = Vec::new();
+        let _ = self.loop_handle.insert_source(read_pipe, move |_, file, _state| {
+            let file = unsafe { file.get_mut() };
+            loop {
+                match file.read(&mut reader_buffer) {
+                    Ok(0) => {
+                        let mut data = Vec::new();
+                        mem::swap(&mut content, &mut data);
+                        crate::dnd::push_event(crate::dnd::DndEvent::Drop { x, y, data });
+                        break PostAction::Remove;
+                    },
+                    Ok(n) => content.extend_from_slice(&reader_buffer[..n]),
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break PostAction::Continue,
+                    Err(_) => break PostAction::Remove,
+                }
+            }
+        });
+    }
 
     // The selection is finished and ready to be used.
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
